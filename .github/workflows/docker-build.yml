@@ -1,0 +1,118 @@
+name: Docker Build
+
+"on":
+  # 定时检测上游新 tag（每 3 天）；无新 tag 则不触发构建
+  schedule:
+    - cron: '0 3 */3 * *'
+  # 手动触发: 在 Actions 界面输入项目名，构建该项目当前 commit（tag = 上游 commit 前 8 位 + latest）
+  workflow_dispatch:
+    inputs:
+      project:
+        description: '项目名（projects/ 下的目录名）'
+        required: false
+        default: ''
+  # 新增/修改 projects/ 下项目目录（新增项目自动首次构建）
+  push:
+    branches: [master]
+    paths: ['projects/**']
+
+concurrency:
+  group: docker-build-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  list-projects:
+    name: 检测需要构建的项目
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.list.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 skopeo（检测 GHCR 已有 tag）
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends skopeo
+
+      - name: 检测需要构建的项目
+        id: list
+        env:
+          GHCR_OWNER: ${{ github.repository_owner }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [[ -n "${{ github.event.inputs.project }}" ]]; then
+            matrix="$(bash scripts/check-tags.sh --force "${{ github.event.inputs.project }}")"
+          else
+            matrix="$(bash scripts/check-tags.sh)"
+          fi
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+          echo "需要构建: $matrix"
+
+  build:
+    name: 构建 ${{ matrix.name }}
+    needs: list-projects
+    if: needs.list-projects.outputs.matrix != '[]'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        entry: ${{ fromJSON(needs.list-projects.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 解析构建条目
+        id: parse
+        env:
+          ENTRY: ${{ matrix.entry }}
+        run: |
+          set -euo pipefail
+          NAME="${ENTRY%%|*}"
+          SPEC="${ENTRY#*|}"
+          OWNER="$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')"
+          # 每个项目自己的默认分支：Dockerfile 顶部 ARG UPSTREAM_REF（可选，缺省 main）
+          DEFAULT_REF="$(sed -n 's/^ARG[[:space:]]\+UPSTREAM_REF=//p' "projects/$NAME/Dockerfile" | head -1 | cut -d'#' -f1 | tr -d '[:space:]' || true)"
+          DEFAULT_REF="${DEFAULT_REF:-main}"
+          echo "name=$NAME" >> "$GITHUB_OUTPUT"
+          echo "owner=$OWNER" >> "$GITHUB_OUTPUT"
+          if [[ "$SPEC" == commit:* ]]; then
+            # commit 快照: 打 <sha8> + latest，构建该项目自己的默认分支
+            echo "tag1=${SPEC#commit:}" >> "$GITHUB_OUTPUT"
+            echo "tag2=latest" >> "$GITHUB_OUTPUT"
+            echo "build_ref=$DEFAULT_REF" >> "$GITHUB_OUTPUT"
+          else
+            # 上游新 tag: 打 <tag> + latest，构建该 tag
+            echo "tag1=$SPEC" >> "$GITHUB_OUTPUT"
+            echo "tag2=latest" >> "$GITHUB_OUTPUT"
+            echo "build_ref=$SPEC" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: 设置 QEMU（多架构支持）
+        uses: docker/setup-qemu-action@v3
+
+      - name: 设置 Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: 登录 GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 构建并推送
+        uses: docker/build-push-action@v6
+        with:
+          context: ./projects/${{ steps.parse.outputs.name }}
+          file: ./projects/${{ steps.parse.outputs.name }}/Dockerfile
+          build-args: |
+            UPSTREAM_REF=${{ steps.parse.outputs.build_ref }}
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ghcr.io/${{ steps.parse.outputs.owner }}/${{ steps.parse.outputs.name }}:${{ steps.parse.outputs.tag1 }}
+            ghcr.io/${{ steps.parse.outputs.owner }}/${{ steps.parse.outputs.name }}:${{ steps.parse.outputs.tag2 }}

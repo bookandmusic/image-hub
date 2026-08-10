@@ -1,0 +1,5 @@
+# 构建/同步产物
+*.log
+.DS_Store
+src/
+.reasonix/

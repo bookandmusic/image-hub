@@ -1,0 +1,34 @@
+name: Docker Sync
+
+# 注意: 必须用引号形式 "on"，YAML 1.1 会把裸 on 解析为布尔值 true，导致 GitHub 拒绝注册该 workflow
+"on":
+  workflow_dispatch:
+    inputs:
+      images:
+        description: '要同步的镜像引用（逗号分隔多个）。示例: nginx:1.21, docker.io/user/app:2.0'
+        required: true
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  sync:
+    name: 同步镜像到 GHCR
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 skopeo（同步工具，ubuntu-latest 默认不含）
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends skopeo
+
+      - name: skopeo 登录 GHCR
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | skopeo login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: 同步镜像（多架构 + 实际 tag + latest）
+        env:
+          GHCR_OWNER: ${{ github.repository_owner }}
+        run: bash scripts/sync-images.sh "${{ github.event.inputs.images }}"
